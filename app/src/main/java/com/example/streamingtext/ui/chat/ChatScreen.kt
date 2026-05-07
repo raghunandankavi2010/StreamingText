@@ -8,12 +8,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.snapshotFlow
@@ -21,8 +23,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.VolumeOff
-import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -40,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -56,16 +59,25 @@ import com.example.streamingtext.ui.chat.components.ChatInputBar
 import com.example.streamingtext.ui.chat.components.EmojiPanel
 import com.example.streamingtext.ui.chat.components.MessageBubble
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ChatScreen(viewModel: ChatViewModel) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val density = LocalDensity.current
+
+    // Request RECORD_AUDIO at runtime when the user taps the mic button.
+    // Declare this FIRST to ensure it's available for capture in lambdas below.
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) viewModel.startVoiceInput()
+        else viewModel.dismissError()
+    }
+
     val listState = rememberLazyListState()
     val snackbarHostState = remember { SnackbarHostState() }
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
-    val context = LocalContext.current
-
-    val density = LocalDensity.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val textFieldFocusRequester = remember { FocusRequester() }
 
@@ -97,25 +109,26 @@ fun ChatScreen(viewModel: ChatViewModel) {
     // Resolve the IME inset object inside composition; reading it inside snapshotFlow
     // would be illegal (it's a @Composable getter).
     val imeInsets = WindowInsets.ime
-    val imeBottomPx = imeInsets.getBottom(density)
+    val currentIsImeVisible by rememberUpdatedState(WindowInsets.isImeVisible)
 
     // Single coroutine that observes the IME bottom inset and updates derived state.
     // Using snapshotFlow avoids relaunching a LaunchedEffect on every animation frame.
-    LaunchedEffect(Unit) {
+    // Keyed by orientation and density to ensure accurate reporting and measurements.
+    LaunchedEffect(orientation, density) {
         var lastPx = 0
         snapshotFlow { imeInsets.getBottom(density) }
             .collect { px ->
                 if (px > savedImeHeightPx) {
                     savedImeHeightPx = px
-                    // Persist for future launches so the emoji panel is correctly sized
-                    // even if the user goes straight to emoji on a fresh app start.
-                    viewModel.onImeHeightObserved(orientation, px)
+                    // Persist for future launches so the emoji panel is correctly sized.
+                    // Access via rememberUpdatedState to ensure we have the latest visibility.
+                    if (currentIsImeVisible) {
+                        viewModel.onImeHeightObserved(orientation, px)
+                    }
                 }
 
                 // Emoji → Keyboard handoff: once IME has risen back to the saved keyboard
-                // height, drop the emoji panel so the IME owns the space again. Gated by
-                // pendingKeyboardRestore so opening the emoji panel (while IME is still
-                // at peak height) doesn't immediately self-cancel.
+                // height, drop the emoji panel so the IME owns the space again.
                 if (pendingKeyboardRestore && savedImeHeightPx > 0 && px >= savedImeHeightPx) {
                     emojiPanelVisible = false
                     pendingKeyboardRestore = false
@@ -144,62 +157,58 @@ fun ChatScreen(viewModel: ChatViewModel) {
         pendingKeyboardRestore = false
     }
 
-    val onEmojiToggle: () -> Unit = {
-        if (emojiPanelVisible) {
-            // Switch back to the system keyboard. Emoji panel stays rendered until IME rises
-            // to the saved height (handled by the LaunchedEffect above), giving a seamless swap.
-            pendingKeyboardRestore = true
-            textFieldFocusRequester.requestFocus()
-            keyboardController?.show()
-        } else {
-            // Bootstrap a saved height the first time, before the keyboard has ever opened.
-            if (savedImeHeightPx == 0) savedImeHeightPx = defaultEmojiHeightPx
-            // Only mark the upcoming IME close as "expected" if the IME was actually open;
-            // otherwise the flag would stay set and swallow a future user-initiated close.
-            if (imeBottomPx > 0) expectingImeClose = true
-            emojiPanelVisible = true
-            pendingKeyboardRestore = false
-            keyboardController?.hide()
+    // Stable callbacks to prevent unnecessary recompositions of child components.
+    val onEmojiToggle: () -> Unit = remember(emojiPanelVisible, savedImeHeightPx, density) {
+        {
+            if (emojiPanelVisible) {
+                // Switch back to the system keyboard.
+                pendingKeyboardRestore = true
+                textFieldFocusRequester.requestFocus()
+                keyboardController?.show()
+            } else {
+                // Switch to emoji panel.
+                if (savedImeHeightPx == 0) savedImeHeightPx = defaultEmojiHeightPx
+                // Read inset directly to avoid capturing a changing value from composition.
+                if (imeInsets.getBottom(density) > 0) expectingImeClose = true
+                emojiPanelVisible = true
+                pendingKeyboardRestore = false
+                keyboardController?.hide()
+            }
         }
     }
 
-    val onEmojiInsert: (String) -> Unit = { emoji ->
-        viewModel.onInputTextChange(uiState.inputText + emoji)
-    }
-
-    val onBackspace: () -> Unit = {
-        val current = uiState.inputText
-        if (current.isNotEmpty()) {
-            // Trim by code points so a single backspace removes a whole emoji (which can be
-            // a surrogate pair) rather than half of one.
-            val cps = current.codePointCount(0, current.length)
-            val cutoff = current.offsetByCodePoints(0, cps - 1)
-            viewModel.onInputTextChange(current.substring(0, cutoff))
+    val currentInputText by rememberUpdatedState(uiState.inputText)
+    val onEmojiInsert: (String) -> Unit = remember {
+        { emoji ->
+            viewModel.onInputTextChange(currentInputText + emoji)
         }
     }
 
-    // Request RECORD_AUDIO at runtime when the user taps the mic button.
-    val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        if (granted) viewModel.startVoiceInput()
-        else snackbarHostState.let {
-            // Show the error via the existing snackbar path by posting to ViewModel state.
-            viewModel.dismissError() // clear any stale error first
+    val onBackspace: () -> Unit = remember {
+        {
+            val current = currentInputText
+            if (current.isNotEmpty()) {
+                // Trim by code points so a single backspace removes a whole emoji (which can be
+                // a surrogate pair) rather than half of one.
+                val cps = current.codePointCount(0, current.length)
+                val cutoff = current.offsetByCodePoints(0, cps - 1)
+                viewModel.onInputTextChange(current.substring(0, cutoff))
+            }
         }
     }
 
-    fun onMicClicked() {
-        val permission = Manifest.permission.RECORD_AUDIO
-        if (ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED) {
-            viewModel.startVoiceInput()
-        } else {
-            permissionLauncher.launch(permission)
+    val onMicClicked: () -> Unit = remember(context, permissionLauncher) {
+        {
+            val permission = Manifest.permission.RECORD_AUDIO
+            if (ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED) {
+                viewModel.startVoiceInput()
+            } else {
+                permissionLauncher.launch(permission)
+            }
         }
     }
 
-    // Auto-scroll whenever new tokens arrive. Keying on content length re-triggers
-    // on every token, not just when a new message is added.
+    // Auto-scroll whenever new tokens arrive or a new message is added.
     val lastLength = uiState.messages.lastOrNull()?.content?.length ?: 0
     LaunchedEffect(uiState.messages.size, lastLength) {
         if (uiState.messages.isNotEmpty()) {
@@ -228,9 +237,9 @@ fun ChatScreen(viewModel: ChatViewModel) {
                     IconButton(onClick = viewModel::toggleTts) {
                         Icon(
                             imageVector = if (uiState.isTtsEnabled)
-                                Icons.Filled.VolumeUp
+                                Icons.AutoMirrored.Filled.VolumeUp
                             else
-                                Icons.Filled.VolumeOff,
+                                Icons.AutoMirrored.Filled.VolumeOff,
                             contentDescription = if (uiState.isTtsEnabled)
                                 "Disable voice output"
                             else
@@ -259,6 +268,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
             // bar (when nothing is showing). That keeps Scaffold's innerPadding.bottom
             // constant during the swap, so the chat list never moves.
             val navBottomPx = WindowInsets.navigationBars.getBottom(density)
+            val imeBottomPx = imeInsets.getBottom(density)
             val lowerRegionPx = if (emojiPanelVisible) {
                 kotlin.math.max(imeBottomPx, savedImeHeightPx)
             } else {
@@ -277,7 +287,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
                     onTextChange = viewModel::onInputTextChange,
                     onSend = viewModel::sendMessage,
                     onStop = viewModel::stopStreaming,
-                    onMicClick = ::onMicClicked,
+                    onMicClick = onMicClicked,
                     onCancelListening = viewModel::cancelVoiceInput,
                     onEmojiToggle = onEmojiToggle,
                 )
