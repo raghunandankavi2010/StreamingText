@@ -65,6 +65,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val density = LocalDensity.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val textFieldFocusRequester = remember { FocusRequester() }
 
     // Request RECORD_AUDIO at runtime when the user taps the mic button.
     // Declare this FIRST to ensure it's available for capture in lambdas below.
@@ -78,12 +80,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
     val listState = rememberLazyListState()
     val snackbarHostState = remember { SnackbarHostState() }
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
-    val keyboardController = LocalSoftwareKeyboardController.current
-    val textFieldFocusRequester = remember { FocusRequester() }
 
-    // Persisted per-orientation IME heights, owned by the ViewModel and backed by
-    // DataStore. Seeding from this means the emoji panel renders at the correct size
-    // on first launch — even before the user has opened the system keyboard.
+    // Persisted per-orientation IME heights.
     val imeHeights by viewModel.imeHeights.collectAsStateWithLifecycle()
     val orientation = LocalConfiguration.current.orientation
     val storedImeHeightPx = when (orientation) {
@@ -91,59 +89,37 @@ fun ChatScreen(viewModel: ChatViewModel) {
         else -> imeHeights.portraitPx
     }
 
-    // Tracks the peak observed IME (keyboard) height in pixels. Seeded from disk so a
-    // fresh chat-screen entry has the right size immediately. Falls back to 300dp only
-    // if nothing has ever been recorded for this orientation.
+    // Tracks the peak observed IME height.
     val defaultEmojiHeightPx = with(density) { 300.dp.roundToPx() }
     var savedImeHeightPx by remember(storedImeHeightPx) { mutableIntStateOf(storedImeHeightPx) }
-    // Whether the user has chosen the emoji panel as the active input surface.
     var emojiPanelVisible by remember { mutableStateOf(false) }
-    // True while we've asked the IME to come back up to replace the emoji panel; the
-    // auto-hide effect uses this to know it's safe to dismiss the panel once IME has risen.
     var pendingKeyboardRestore by remember { mutableStateOf(false) }
-    // True while we are intentionally closing the IME (because the user just tapped the
-    // emoji button). Prevents the "user pressed IME's down button" detector below from
-    // firing for our own hide() call.
     var expectingImeClose by remember { mutableStateOf(false) }
 
-    // Resolve the IME inset object inside composition; reading it inside snapshotFlow
-    // would be illegal (it's a @Composable getter).
     val imeInsets = WindowInsets.ime
     val currentIsImeVisible by rememberUpdatedState(WindowInsets.isImeVisible)
 
-    // Single coroutine that observes the IME bottom inset and updates derived state.
-    // Using snapshotFlow avoids relaunching a LaunchedEffect on every animation frame.
-    // Keyed by orientation and density to ensure accurate reporting and measurements.
+    // Sync IME height and handle transitions.
     LaunchedEffect(orientation, density) {
         var lastPx = 0
         snapshotFlow { imeInsets.getBottom(density) }
             .collect { px ->
                 if (px > savedImeHeightPx) {
                     savedImeHeightPx = px
-                    // Persist for future launches so the emoji panel is correctly sized.
-                    // Access via rememberUpdatedState to ensure we have the latest visibility.
                     if (currentIsImeVisible) {
                         viewModel.onImeHeightObserved(orientation, px)
                     }
                 }
 
-                // Emoji → Keyboard handoff: once IME has risen back to the saved keyboard
-                // height, drop the emoji panel so the IME owns the space again.
                 if (pendingKeyboardRestore && savedImeHeightPx > 0 && px >= savedImeHeightPx) {
                     emojiPanelVisible = false
                     pendingKeyboardRestore = false
                 }
 
-                // IME is closing.
                 if (px < lastPx) {
                     if (expectingImeClose) {
-                        // We initiated this close (user tapped emoji from keyboard mode).
-                        // Once it has reached zero, the close is consumed.
                         if (px == 0) expectingImeClose = false
                     } else if (emojiPanelVisible) {
-                        // The IME is closing without us asking — the user pressed the
-                        // keyboard's down button (or the system back) to dismiss it.
-                        // WhatsApp dismisses the emoji panel in this case too.
                         emojiPanelVisible = false
                         pendingKeyboardRestore = false
                     }
@@ -157,18 +133,15 @@ fun ChatScreen(viewModel: ChatViewModel) {
         pendingKeyboardRestore = false
     }
 
-    // Stable callbacks to prevent unnecessary recompositions of child components.
+    // Stable callbacks to prevent unnecessary recompositions.
     val onEmojiToggle: () -> Unit = remember(emojiPanelVisible, savedImeHeightPx, density) {
         {
             if (emojiPanelVisible) {
-                // Switch back to the system keyboard.
                 pendingKeyboardRestore = true
                 textFieldFocusRequester.requestFocus()
                 keyboardController?.show()
             } else {
-                // Switch to emoji panel.
                 if (savedImeHeightPx == 0) savedImeHeightPx = defaultEmojiHeightPx
-                // Read inset directly to avoid capturing a changing value from composition.
                 if (imeInsets.getBottom(density) > 0) expectingImeClose = true
                 emojiPanelVisible = true
                 pendingKeyboardRestore = false
@@ -188,8 +161,6 @@ fun ChatScreen(viewModel: ChatViewModel) {
         {
             val current = currentInputText
             if (current.isNotEmpty()) {
-                // Trim by code points so a single backspace removes a whole emoji (which can be
-                // a surrogate pair) rather than half of one.
                 val cps = current.codePointCount(0, current.length)
                 val cutoff = current.offsetByCodePoints(0, cps - 1)
                 viewModel.onInputTextChange(current.substring(0, cutoff))
@@ -226,9 +197,6 @@ fun ChatScreen(viewModel: ChatViewModel) {
 
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
-        // We handle insets explicitly in topBar (status bar) and bottomBar (ime + nav bar);
-        // setting contentWindowInsets to zero prevents Scaffold from double-counting them
-        // in the body's innerPadding.
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
@@ -258,15 +226,6 @@ fun ChatScreen(viewModel: ChatViewModel) {
             )
         },
         bottomBar = {
-            // WhatsApp-style layout. The emoji panel is rendered at its FULL size
-            // (savedImeHeight), anchored to the screen bottom. The IME draws on top of it.
-            // As the IME slides off-screen the emoji panel is revealed underneath — its
-            // content never reflows during the swap, so there is no visible flicker.
-            //
-            // The "lower region" below the input bar reserves whichever is taller: the IME
-            // itself, the saved keyboard height (when emoji is showing), or the navigation
-            // bar (when nothing is showing). That keeps Scaffold's innerPadding.bottom
-            // constant during the swap, so the chat list never moves.
             val navBottomPx = WindowInsets.navigationBars.getBottom(density)
             val imeBottomPx = imeInsets.getBottom(density)
             val lowerRegionPx = if (emojiPanelVisible) {
@@ -296,8 +255,6 @@ fun ChatScreen(viewModel: ChatViewModel) {
                         .fillMaxWidth()
                         .height(lowerRegionDp),
                 ) {
-                    // Mounted at full size so the IME can simply overlay it. The panel
-                    // does not re-measure/reflow as the keyboard hides, so there's no jank.
                     if (emojiPanelVisible) {
                         EmojiPanel(
                             onEmojiClick = onEmojiInsert,
