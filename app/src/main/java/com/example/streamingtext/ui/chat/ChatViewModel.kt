@@ -7,17 +7,24 @@ import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.AP
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import com.example.streamingtext.BuildConfig
+import com.example.streamingtext.data.local.ImeMetricsDataSource
+import com.example.streamingtext.data.model.ImeHeights
 import com.example.streamingtext.data.model.Message
 import com.example.streamingtext.data.model.Role
 import com.example.streamingtext.data.remote.ClaudeApiService
 import com.example.streamingtext.data.repository.ChatRepositoryImpl
+import com.example.streamingtext.data.repository.ImeMetricsRepositoryImpl
+import com.example.streamingtext.domain.usecase.ObserveImeHeightsUseCase
+import com.example.streamingtext.domain.usecase.RecordImeHeightUseCase
 import com.example.streamingtext.domain.usecase.StreamMessagesUseCase
 import com.example.streamingtext.ui.voice.VoiceManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -33,10 +40,27 @@ data class ChatUiState(
 class ChatViewModel(
     application: Application,
     private val streamMessages: StreamMessagesUseCase,
+    observeImeHeights: ObserveImeHeightsUseCase,
+    private val recordImeHeight: RecordImeHeightUseCase,
 ) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
+
+    /**
+     * Persisted per-orientation IME heights, hot-shared as a [StateFlow] so the chat
+     * screen can read the seed value synchronously at first composition.
+     */
+    val imeHeights: StateFlow<ImeHeights> = observeImeHeights()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = ImeHeights(),
+        )
+
+    fun onImeHeightObserved(orientation: Int, heightPx: Int) {
+        viewModelScope.launch { recordImeHeight(orientation, heightPx) }
+    }
 
     private var streamingJob: Job? = null
 
@@ -201,9 +225,21 @@ class ChatViewModel(
                 val application = checkNotNull(extras[APPLICATION_KEY])
                 val apiKey = BuildConfig.CLAUDE_API_KEY
                 val apiService = if (apiKey.isNotBlank()) ClaudeApiService(apiKey) else null
-                val repository = ChatRepositoryImpl(claudeApiService = apiService)
-                val useCase = StreamMessagesUseCase(repository)
-                return ChatViewModel(application, useCase) as T
+                val chatRepository = ChatRepositoryImpl(claudeApiService = apiService)
+                val streamMessagesUseCase = StreamMessagesUseCase(chatRepository)
+
+                val imeMetricsRepository = ImeMetricsRepositoryImpl(
+                    dataSource = ImeMetricsDataSource(application),
+                )
+                val observeImeHeightsUseCase = ObserveImeHeightsUseCase(imeMetricsRepository)
+                val recordImeHeightUseCase = RecordImeHeightUseCase(imeMetricsRepository)
+
+                return ChatViewModel(
+                    application = application,
+                    streamMessages = streamMessagesUseCase,
+                    observeImeHeights = observeImeHeightsUseCase,
+                    recordImeHeight = recordImeHeightUseCase,
+                ) as T
             }
         }
     }

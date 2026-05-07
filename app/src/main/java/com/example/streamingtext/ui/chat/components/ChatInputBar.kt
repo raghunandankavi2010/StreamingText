@@ -17,8 +17,11 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.outlined.EmojiEmotions
+import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -29,6 +32,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.unit.dp
 
 @Composable
@@ -36,11 +41,14 @@ fun ChatInputBar(
     inputText: String,
     isStreaming: Boolean,
     isListening: Boolean,
+    isEmojiOpen: Boolean,
+    textFieldFocusRequester: FocusRequester,
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
     onMicClick: () -> Unit,
     onCancelListening: () -> Unit,
+    onEmojiToggle: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -60,10 +68,27 @@ fun ChatInputBar(
                 placeholder = {
                     Text(if (isListening) "Listening…" else "Message")
                 },
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .focusRequester(textFieldFocusRequester),
                 maxLines = 4,
                 enabled = !isStreaming && !isListening,
                 shape = MaterialTheme.shapes.extraLarge,
+                leadingIcon = {
+                    IconButton(onClick = onEmojiToggle) {
+                        Icon(
+                            imageVector = if (isEmojiOpen)
+                                Icons.Outlined.Keyboard
+                            else
+                                Icons.Outlined.EmojiEmotions,
+                            contentDescription = if (isEmojiOpen)
+                                "Show keyboard"
+                            else
+                                "Show emoji",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                },
             )
 
             Spacer(modifier = Modifier.width(8.dp))

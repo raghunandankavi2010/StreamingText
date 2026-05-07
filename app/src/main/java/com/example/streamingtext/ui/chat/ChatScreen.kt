@@ -2,14 +2,21 @@ package com.example.streamingtext.ui.chat
 
 import android.Manifest
 import android.content.pm.PackageManager
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -30,15 +37,23 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.streamingtext.ui.chat.components.ChatInputBar
+import com.example.streamingtext.ui.chat.components.EmojiPanel
 import com.example.streamingtext.ui.chat.components.MessageBubble
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -49,6 +64,119 @@ fun ChatScreen(viewModel: ChatViewModel) {
     val snackbarHostState = remember { SnackbarHostState() }
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
     val context = LocalContext.current
+
+    val density = LocalDensity.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val textFieldFocusRequester = remember { FocusRequester() }
+
+    // Persisted per-orientation IME heights, owned by the ViewModel and backed by
+    // DataStore. Seeding from this means the emoji panel renders at the correct size
+    // on first launch — even before the user has opened the system keyboard.
+    val imeHeights by viewModel.imeHeights.collectAsStateWithLifecycle()
+    val orientation = LocalConfiguration.current.orientation
+    val storedImeHeightPx = when (orientation) {
+        android.content.res.Configuration.ORIENTATION_LANDSCAPE -> imeHeights.landscapePx
+        else -> imeHeights.portraitPx
+    }
+
+    // Tracks the peak observed IME (keyboard) height in pixels. Seeded from disk so a
+    // fresh chat-screen entry has the right size immediately. Falls back to 300dp only
+    // if nothing has ever been recorded for this orientation.
+    val defaultEmojiHeightPx = with(density) { 300.dp.roundToPx() }
+    var savedImeHeightPx by remember(storedImeHeightPx) { mutableIntStateOf(storedImeHeightPx) }
+    // Whether the user has chosen the emoji panel as the active input surface.
+    var emojiPanelVisible by remember { mutableStateOf(false) }
+    // True while we've asked the IME to come back up to replace the emoji panel; the
+    // auto-hide effect uses this to know it's safe to dismiss the panel once IME has risen.
+    var pendingKeyboardRestore by remember { mutableStateOf(false) }
+    // True while we are intentionally closing the IME (because the user just tapped the
+    // emoji button). Prevents the "user pressed IME's down button" detector below from
+    // firing for our own hide() call.
+    var expectingImeClose by remember { mutableStateOf(false) }
+
+    // Resolve the IME inset object inside composition; reading it inside snapshotFlow
+    // would be illegal (it's a @Composable getter).
+    val imeInsets = WindowInsets.ime
+    val imeBottomPx = imeInsets.getBottom(density)
+
+    // Single coroutine that observes the IME bottom inset and updates derived state.
+    // Using snapshotFlow avoids relaunching a LaunchedEffect on every animation frame.
+    LaunchedEffect(Unit) {
+        var lastPx = 0
+        snapshotFlow { imeInsets.getBottom(density) }
+            .collect { px ->
+                if (px > savedImeHeightPx) {
+                    savedImeHeightPx = px
+                    // Persist for future launches so the emoji panel is correctly sized
+                    // even if the user goes straight to emoji on a fresh app start.
+                    viewModel.onImeHeightObserved(orientation, px)
+                }
+
+                // Emoji → Keyboard handoff: once IME has risen back to the saved keyboard
+                // height, drop the emoji panel so the IME owns the space again. Gated by
+                // pendingKeyboardRestore so opening the emoji panel (while IME is still
+                // at peak height) doesn't immediately self-cancel.
+                if (pendingKeyboardRestore && savedImeHeightPx > 0 && px >= savedImeHeightPx) {
+                    emojiPanelVisible = false
+                    pendingKeyboardRestore = false
+                }
+
+                // IME is closing.
+                if (px < lastPx) {
+                    if (expectingImeClose) {
+                        // We initiated this close (user tapped emoji from keyboard mode).
+                        // Once it has reached zero, the close is consumed.
+                        if (px == 0) expectingImeClose = false
+                    } else if (emojiPanelVisible) {
+                        // The IME is closing without us asking — the user pressed the
+                        // keyboard's down button (or the system back) to dismiss it.
+                        // WhatsApp dismisses the emoji panel in this case too.
+                        emojiPanelVisible = false
+                        pendingKeyboardRestore = false
+                    }
+                }
+                lastPx = px
+            }
+    }
+
+    BackHandler(enabled = emojiPanelVisible) {
+        emojiPanelVisible = false
+        pendingKeyboardRestore = false
+    }
+
+    val onEmojiToggle: () -> Unit = {
+        if (emojiPanelVisible) {
+            // Switch back to the system keyboard. Emoji panel stays rendered until IME rises
+            // to the saved height (handled by the LaunchedEffect above), giving a seamless swap.
+            pendingKeyboardRestore = true
+            textFieldFocusRequester.requestFocus()
+            keyboardController?.show()
+        } else {
+            // Bootstrap a saved height the first time, before the keyboard has ever opened.
+            if (savedImeHeightPx == 0) savedImeHeightPx = defaultEmojiHeightPx
+            // Only mark the upcoming IME close as "expected" if the IME was actually open;
+            // otherwise the flag would stay set and swallow a future user-initiated close.
+            if (imeBottomPx > 0) expectingImeClose = true
+            emojiPanelVisible = true
+            pendingKeyboardRestore = false
+            keyboardController?.hide()
+        }
+    }
+
+    val onEmojiInsert: (String) -> Unit = { emoji ->
+        viewModel.onInputTextChange(uiState.inputText + emoji)
+    }
+
+    val onBackspace: () -> Unit = {
+        val current = uiState.inputText
+        if (current.isNotEmpty()) {
+            // Trim by code points so a single backspace removes a whole emoji (which can be
+            // a surrogate pair) rather than half of one.
+            val cps = current.codePointCount(0, current.length)
+            val cutoff = current.offsetByCodePoints(0, cps - 1)
+            viewModel.onInputTextChange(current.substring(0, cutoff))
+        }
+    }
 
     // Request RECORD_AUDIO at runtime when the user taps the mic button.
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -89,11 +217,14 @@ fun ChatScreen(viewModel: ChatViewModel) {
 
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        // We handle insets explicitly in topBar (status bar) and bottomBar (ime + nav bar);
+        // setting contentWindowInsets to zero prevents Scaffold from double-counting them
+        // in the body's innerPadding.
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
                 title = { Text("AI Chat") },
                 actions = {
-                    // TTS toggle — speaker icon lights up when enabled
                     IconButton(onClick = viewModel::toggleTts) {
                         Icon(
                             imageVector = if (uiState.isTtsEnabled)
@@ -118,16 +249,57 @@ fun ChatScreen(viewModel: ChatViewModel) {
             )
         },
         bottomBar = {
-            ChatInputBar(
-                inputText = uiState.inputText,
-                isStreaming = uiState.isStreaming,
-                isListening = uiState.isListening,
-                onTextChange = viewModel::onInputTextChange,
-                onSend = viewModel::sendMessage,
-                onStop = viewModel::stopStreaming,
-                onMicClick = ::onMicClicked,
-                onCancelListening = viewModel::cancelVoiceInput,
-            )
+            // WhatsApp-style layout. The emoji panel is rendered at its FULL size
+            // (savedImeHeight), anchored to the screen bottom. The IME draws on top of it.
+            // As the IME slides off-screen the emoji panel is revealed underneath — its
+            // content never reflows during the swap, so there is no visible flicker.
+            //
+            // The "lower region" below the input bar reserves whichever is taller: the IME
+            // itself, the saved keyboard height (when emoji is showing), or the navigation
+            // bar (when nothing is showing). That keeps Scaffold's innerPadding.bottom
+            // constant during the swap, so the chat list never moves.
+            val navBottomPx = WindowInsets.navigationBars.getBottom(density)
+            val lowerRegionPx = if (emojiPanelVisible) {
+                kotlin.math.max(imeBottomPx, savedImeHeightPx)
+            } else {
+                kotlin.math.max(imeBottomPx, navBottomPx)
+            }
+            val lowerRegionDp = with(density) { lowerRegionPx.toDp() }
+            val savedImeHeightDp = with(density) { savedImeHeightPx.toDp() }
+
+            Column(modifier = Modifier.fillMaxWidth()) {
+                ChatInputBar(
+                    inputText = uiState.inputText,
+                    isStreaming = uiState.isStreaming,
+                    isListening = uiState.isListening,
+                    isEmojiOpen = emojiPanelVisible,
+                    textFieldFocusRequester = textFieldFocusRequester,
+                    onTextChange = viewModel::onInputTextChange,
+                    onSend = viewModel::sendMessage,
+                    onStop = viewModel::stopStreaming,
+                    onMicClick = ::onMicClicked,
+                    onCancelListening = viewModel::cancelVoiceInput,
+                    onEmojiToggle = onEmojiToggle,
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(lowerRegionDp),
+                ) {
+                    // Mounted at full size so the IME can simply overlay it. The panel
+                    // does not re-measure/reflow as the keyboard hides, so there's no jank.
+                    if (emojiPanelVisible) {
+                        EmojiPanel(
+                            onEmojiClick = onEmojiInsert,
+                            onBackspace = onBackspace,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(savedImeHeightDp)
+                                .align(Alignment.BottomCenter),
+                        )
+                    }
+                }
+            }
         },
         snackbarHost = {
             SnackbarHost(snackbarHostState) { data ->
